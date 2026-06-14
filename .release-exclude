@@ -1,0 +1,8 @@
+# Paths tracked on `main` that must NOT appear on `release` (the public mirror).
+# Stripped after every squash-merge from main.
+
+# Maintainer-only release plumbing (the public justfile imports it via `import?`).
+release.just
+
+# Internal design/planning brief — kept off the public mirror.
+terva-git-worktree-design.md

@@ -1,0 +1,493 @@
+// Package worktree is the pure logic for the terva-git-worktree extension: it
+// creates, lists, and removes git worktrees for the current repository and
+// reasons about reuse via an available/claimed model plus the commit each
+// worktree was branched from. It depends only on the standard library and a
+// real `git` binary, so it is fully unit-testable against a temp repo without
+// the terva SDK (see worktree_test.go). Thin SDK glue lives in app.go.
+package worktree
+
+import (
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	branchPrefix = "wt/"
+	// defaultClaimTTL is how long a claim from a non-current session is treated
+	// as live before it's considered (reported, not auto-stolen) stale.
+	defaultClaimTTL = 12 * time.Hour
+)
+
+// Manager runs the worktree operations. The clock, pid-liveness probe, self pid,
+// and TTL are fields so tests can drive staleness deterministically.
+type Manager struct {
+	mu       sync.Mutex
+	now      func() time.Time
+	pidAlive func(int) bool
+	selfPID  int
+	ttl      time.Duration
+}
+
+// NewManager returns a Manager wired to the real clock and process.
+func NewManager() *Manager {
+	return &Manager{
+		now:      time.Now,
+		pidAlive: pidAlive,
+		selfPID:  os.Getpid(),
+		ttl:      defaultClaimTTL,
+	}
+}
+
+// status is the derived per-worktree state returned by list & create.
+type status struct {
+	State       string // "available" | "claimed"
+	ClaimedBy   string // "self" | "<session>" | ""(none, when available)
+	Stale       bool
+	StaleReason string
+}
+
+// deriveStatus classifies a claim relative to the current session. A claim owned
+// by the current session is "claimed by self". A claim from another session is
+// live (claimed by them) only while its pid is alive and it's within TTL;
+// otherwise it's available but reported stale, never silently reclaimed.
+func (m *Manager) deriveStatus(c *Claim, currentSession string) status {
+	if c == nil {
+		return status{State: "available"}
+	}
+	if currentSession != "" && c.SessionID == currentSession {
+		return status{State: "claimed", ClaimedBy: "self"}
+	}
+	pidDead := !m.pidAlive(c.PID)
+	expired := false
+	if t, err := time.Parse(time.RFC3339, c.ClaimedAt); err == nil {
+		expired = m.now().Sub(t) > m.ttl
+	} else {
+		expired = true // unparseable timestamp ⇒ treat as expired
+	}
+	if !pidDead && !expired {
+		owner := c.SessionID
+		if owner == "" {
+			owner = "(no session)"
+		}
+		return status{State: "claimed", ClaimedBy: owner}
+	}
+	owner := c.SessionID
+	if owner == "" {
+		owner = "(no session)"
+	}
+	var reasons []string
+	if pidDead {
+		reasons = append(reasons, fmt.Sprintf("owning process (pid %d) is gone", c.PID))
+	}
+	if expired {
+		reasons = append(reasons, "claim older than TTL")
+	}
+	return status{
+		State:       "available",
+		Stale:       true,
+		StaleReason: fmt.Sprintf("%s: %s", owner, strings.Join(reasons, ", ")),
+	}
+}
+
+func (m *Manager) nowRFC() string { return m.now().UTC().Format(time.RFC3339) }
+
+func (m *Manager) newClaim(session string) *Claim {
+	return &Claim{SessionID: session, PID: m.selfPID, ClaimedAt: m.nowRFC()}
+}
+
+// reconcile drops registry entries git no longer knows about (worktree removed
+// out of band). Reports whether the registry changed.
+func reconcile(r *repo, reg *Registry, gwts map[string]gitWorktree) bool {
+	changed := false
+	for name := range reg.Worktrees {
+		if _, ok := gwts[canonPath(r.worktreePath(name))]; !ok {
+			delete(reg.Worktrees, name)
+			changed = true
+		}
+	}
+	return changed
+}
+
+// CreateArgs are the inputs to Create.
+type CreateArgs struct {
+	Name             string
+	Base             string // optional ref/sha; default: current HEAD
+	ReuseIfAvailable bool   // if Name exists & available, claim+return it
+}
+
+// CreateResult is the JSON shape Create returns to the agent.
+type CreateResult struct {
+	Name       string `json:"name"`
+	Path       string `json:"path"`
+	Branch     string `json:"branch"`
+	BaseCommit string `json:"base_commit"`
+	BaseRef    string `json:"base_ref"`
+	HeadCommit string `json:"head_commit"`
+	Status     string `json:"status"`     // create always claims => "claimed"
+	ClaimedBy  string `json:"claimed_by"` // "self"
+	Reused     bool   `json:"reused"`     // true if an existing worktree was returned
+}
+
+// Create makes (or reuses) a worktree and claims it for the current session.
+// Asking for a name that already exists and is available claims and returns it
+// instead of erroring; a name claimed by another live session is refused.
+func (m *Manager) Create(env Env, args CreateArgs) (*CreateResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	name := slugify(args.Name)
+	if name == "" {
+		return nil, fmt.Errorf("name is required")
+	}
+	r, err := resolveRepo(env)
+	if err != nil {
+		return nil, err
+	}
+	lk, err := acquireLock(r.lockPath())
+	if err != nil {
+		return nil, fmt.Errorf("lock repo: %w", err)
+	}
+	defer lk.release()
+
+	reg, err := loadRegistry(r.fs, r.registryName())
+	if err != nil {
+		return nil, err
+	}
+	gwts, err := listWorktrees(r.cwd)
+	if err != nil {
+		return nil, err
+	}
+	reconcile(r, reg, gwts)
+
+	if entry, ok := reg.Worktrees[name]; ok {
+		st := m.deriveStatus(entry.Claim, env.SessionID)
+		switch {
+		case st.ClaimedBy == "self":
+			return m.createResult(r, name, entry, true), nil
+		case st.State == "available":
+			if !args.ReuseIfAvailable {
+				return nil, fmt.Errorf("worktree %q already exists; pass a different name or set reuse_if_available", name)
+			}
+			entry.Claim = m.newClaim(env.SessionID)
+			if err := saveRegistry(r.registryPath(), reg); err != nil {
+				return nil, err
+			}
+			return m.createResult(r, name, entry, true), nil
+		default: // claimed by another live session
+			return nil, fmt.Errorf("worktree %q is claimed by %s; pick a different name", name, st.ClaimedBy)
+		}
+	}
+
+	path := r.worktreePath(name)
+	if _, ok := gwts[canonPath(path)]; ok {
+		return nil, fmt.Errorf("an unmanaged worktree already exists at %s; remove it or pick another name", path)
+	}
+
+	branch := branchPrefix + name
+	resume := branchExists(r.cwd, branch)
+
+	// Determine the base. A leftover branch from a prior remove (which keeps the
+	// branch by default) is resumed on its own tip; an explicit base then can't
+	// be honored, so flag the conflict instead of silently ignoring it.
+	var baseRef, baseArg, baseCommit string
+	if resume {
+		if args.Base != "" {
+			return nil, fmt.Errorf("branch %s already exists from a previous worktree; cannot apply base %q — remove it (delete_branch) or pick another name", branch, args.Base)
+		}
+		baseRef = branch
+		baseCommit, err = resolveCommit(r.cwd, branch)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		baseRef, baseArg = args.Base, args.Base
+		if baseRef == "" {
+			baseRef = currentRef(r.cwd)
+			baseArg = "HEAD"
+		}
+		baseCommit, err = resolveCommit(r.cwd, baseArg)
+		if err != nil {
+			return nil, fmt.Errorf("base %q is not a valid ref", baseRef)
+		}
+	}
+
+	if err := os.MkdirAll(r.worktreesDir(), 0o755); err != nil {
+		return nil, err
+	}
+	add := []string{"worktree", "add", "--quiet", path}
+	if resume {
+		add = append(add, branch) // attach the existing branch
+	} else {
+		add = append(add, "-b", branch, baseArg) // fresh branch off base
+	}
+	if _, err := runGit(r.cwd, add...); err != nil {
+		return nil, err
+	}
+	entry := &Entry{
+		Branch:     branch,
+		BaseCommit: baseCommit,
+		BaseRef:    baseRef,
+		CreatedAt:  m.nowRFC(),
+		Claim:      m.newClaim(env.SessionID),
+	}
+	reg.Worktrees[name] = entry
+	if err := saveRegistry(r.registryPath(), reg); err != nil {
+		// Don't strand a worktree git knows about but our registry doesn't.
+		_, _ = runGit(r.cwd, "worktree", "remove", "--force", path)
+		return nil, err
+	}
+	return m.createResult(r, name, entry, false), nil
+}
+
+func (m *Manager) createResult(r *repo, name string, e *Entry, reused bool) *CreateResult {
+	path := r.worktreePath(name)
+	return &CreateResult{
+		Name:       name,
+		Path:       path,
+		Branch:     e.Branch,
+		BaseCommit: e.BaseCommit,
+		BaseRef:    e.BaseRef,
+		HeadCommit: headCommit(path),
+		Status:     "claimed",
+		ClaimedBy:  "self",
+		Reused:     reused,
+	}
+}
+
+// ListResult is the JSON shape List returns.
+type ListResult struct {
+	RepoKey     string      `json:"repo_key"`
+	CWDWorktree *string     `json:"cwd_worktree"` // listed worktree cwd is in, or null
+	Worktrees   []*ListItem `json:"worktrees"`
+}
+
+// ListItem is one worktree in a ListResult.
+type ListItem struct {
+	Name        string  `json:"name"`
+	Path        string  `json:"path"`
+	Branch      string  `json:"branch"`
+	BaseCommit  string  `json:"base_commit"`
+	BaseRef     string  `json:"base_ref"`
+	HeadCommit  string  `json:"head_commit"`
+	Status      string  `json:"status"`
+	ClaimedBy   *string `json:"claimed_by"` // "self" | "<session>" | null
+	StaleReason string  `json:"stale_reason,omitempty"`
+	Dirty       bool    `json:"dirty"`
+	Unmanaged   bool    `json:"unmanaged,omitempty"`
+}
+
+// List joins git's worktree list with the registry, derives status, and reports
+// drift (base vs current HEAD), dirtiness, and which worktree cwd is in. It is
+// read-only except for reconciling away worktrees git has dropped.
+func (m *Manager) List(env Env, includeStale bool) (*ListResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	r, err := resolveRepo(env)
+	if err != nil {
+		return nil, err
+	}
+	lk, err := acquireLock(r.lockPath())
+	if err != nil {
+		return nil, fmt.Errorf("lock repo: %w", err)
+	}
+	defer lk.release()
+
+	reg, err := loadRegistry(r.fs, r.registryName())
+	if err != nil {
+		return nil, err
+	}
+	gwts, err := listWorktrees(r.cwd)
+	if err != nil {
+		return nil, err
+	}
+	if reconcile(r, reg, gwts) {
+		_ = saveRegistry(r.registryPath(), reg)
+	}
+
+	items := make([]*ListItem, 0, len(reg.Worktrees))
+	for _, name := range sortedNames(reg.Worktrees) {
+		e := reg.Worktrees[name]
+		path := r.worktreePath(name)
+		gw := gwts[canonPath(path)]
+		st := m.deriveStatus(e.Claim, env.SessionID)
+		dirty, _ := worktreeDirty(path)
+		head := gw.Head
+		if head == "" {
+			head = headCommit(path)
+		}
+		items = append(items, &ListItem{
+			Name:        name,
+			Path:        path,
+			Branch:      e.Branch,
+			BaseCommit:  e.BaseCommit,
+			BaseRef:     e.BaseRef,
+			HeadCommit:  head,
+			Status:      st.State,
+			ClaimedBy:   claimedByPtr(st.ClaimedBy),
+			StaleReason: st.StaleReason,
+			Dirty:       dirty,
+		})
+	}
+
+	// Surface git worktrees living under our worktrees dir that we don't track
+	// (e.g. created out-of-band) as unmanaged, so the agent isn't surprised.
+	prefix := canonPath(r.worktreesDir()) + string(os.PathSeparator)
+	for cp, gw := range gwts {
+		if !strings.HasPrefix(cp, prefix) {
+			continue
+		}
+		name := lastPathElem(gw.Path)
+		if _, ok := reg.Worktrees[name]; ok {
+			continue
+		}
+		dirty, _ := worktreeDirty(gw.Path)
+		items = append(items, &ListItem{
+			Name:       name,
+			Path:       gw.Path,
+			Branch:     gw.Branch,
+			HeadCommit: gw.Head,
+			Status:     "available",
+			Dirty:      dirty,
+			Unmanaged:  true,
+		})
+	}
+
+	var cwdName *string
+	if top := topLevel(env.CWD); top != "" {
+		for _, it := range items {
+			if canonPath(it.Path) == top {
+				n := it.Name
+				cwdName = &n
+				break
+			}
+		}
+	}
+
+	return &ListResult{RepoKey: r.key, CWDWorktree: cwdName, Worktrees: items}, nil
+}
+
+// RemoveArgs are the inputs to Remove.
+type RemoveArgs struct {
+	Name         string
+	Force        bool
+	DeleteBranch bool
+}
+
+// RemoveResult is the JSON shape Remove returns.
+type RemoveResult struct {
+	Name          string `json:"name"`
+	Removed       bool   `json:"removed"`
+	BranchDeleted bool   `json:"branch_deleted"`
+}
+
+// Remove deletes a managed worktree. It refuses when the worktree has
+// uncommitted changes or unmerged/unpushed commits unless Force is set — a clear
+// error the agent can act on, not a silent destroy. The branch is left by
+// default (the work may be unmerged); DeleteBranch is an explicit opt-in.
+func (m *Manager) Remove(env Env, args RemoveArgs) (*RemoveResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	name := slugify(args.Name)
+	if name == "" {
+		return nil, fmt.Errorf("name is required")
+	}
+	r, err := resolveRepo(env)
+	if err != nil {
+		return nil, err
+	}
+	lk, err := acquireLock(r.lockPath())
+	if err != nil {
+		return nil, fmt.Errorf("lock repo: %w", err)
+	}
+	defer lk.release()
+
+	reg, err := loadRegistry(r.fs, r.registryName())
+	if err != nil {
+		return nil, err
+	}
+	gwts, err := listWorktrees(r.cwd)
+	if err != nil {
+		return nil, err
+	}
+
+	entry, ok := reg.Worktrees[name]
+	if !ok {
+		return nil, fmt.Errorf("no managed worktree %q", name)
+	}
+	path := r.worktreePath(name)
+	_, known := gwts[canonPath(path)]
+
+	// Enforce safety only when the checkout actually exists on disk. If the dir
+	// was deleted out from under git, there's nothing to protect — fall through
+	// to prune-based cleanup so a vanished worktree doesn't strand its registry
+	// entry (the design's "recover gracefully" path).
+	if known && !args.Force && dirExists(path) {
+		dirty, derr := worktreeDirty(path)
+		if derr != nil || dirty {
+			return nil, fmt.Errorf("worktree %q has uncommitted changes; commit or stash them, or pass force:true", name)
+		}
+		if unmerged, why := hasUnmergedWork(path, entry.BaseCommit); unmerged {
+			return nil, fmt.Errorf("worktree %q has unmerged work (%s); pass force:true to remove anyway", name, why)
+		}
+	}
+
+	if known {
+		rmArgs := []string{"worktree", "remove", path}
+		if args.Force {
+			rmArgs = []string{"worktree", "remove", "--force", path}
+		}
+		if _, err := runGit(r.cwd, rmArgs...); err != nil {
+			// The dir may have been deleted out from under git; prune and treat
+			// as removed if that clears it, else surface the original error.
+			if _, perr := runGit(r.cwd, "worktree", "prune"); perr != nil {
+				return nil, err
+			}
+		}
+	}
+	_, _ = runGit(r.cwd, "worktree", "prune")
+
+	branchDeleted := false
+	if args.DeleteBranch && entry.Branch != "" {
+		if _, err := runGit(r.cwd, "branch", "-D", entry.Branch); err == nil {
+			branchDeleted = true
+		}
+	}
+
+	delete(reg.Worktrees, name)
+	if err := saveRegistry(r.registryPath(), reg); err != nil {
+		return nil, err
+	}
+	return &RemoveResult{Name: name, Removed: true, BranchDeleted: branchDeleted}, nil
+}
+
+func claimedByPtr(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+func sortedNames(m map[string]*Entry) []string {
+	names := make([]string, 0, len(m))
+	for n := range m {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// lastPathElem returns the final element of a slash- or backslash-separated
+// path without depending on the host separator (git reports forward slashes).
+func lastPathElem(p string) string {
+	p = strings.TrimRight(p, "/\\")
+	if i := strings.LastIndexAny(p, "/\\"); i >= 0 {
+		return p[i+1:]
+	}
+	return p
+}

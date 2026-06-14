@@ -1,0 +1,4 @@
+# Paths that live only on `release` and are force-restored after each squash.
+
+.release-exclude
+.release-only
