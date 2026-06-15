@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -150,6 +151,33 @@ func hasUnmergedWork(dir, baseCommit string) (bool, string) {
 		}
 	}
 	return false, ""
+}
+
+// aheadCommits returns how many commits HEAD is ahead of base and the oneline
+// subjects of up to max of them (newest first). Best-effort: returns (0, nil) on
+// any git error or when base is empty.
+func aheadCommits(dir, base string, max int) (int, []string) {
+	if base == "" {
+		return 0, nil
+	}
+	out, err := runGit(dir, "rev-list", "--count", base+"..HEAD")
+	if err != nil {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil || n == 0 {
+		return n, nil
+	}
+	args := []string{"log", "--oneline", "--no-decorate"}
+	if max > 0 {
+		args = append(args, fmt.Sprintf("-%d", max))
+	}
+	args = append(args, base+"..HEAD")
+	logOut, err := runGit(dir, args...)
+	if err != nil || logOut == "" {
+		return n, nil
+	}
+	return n, strings.Split(logOut, "\n")
 }
 
 // topLevel returns the working-tree root of dir (the worktree cwd is in), used

@@ -87,7 +87,7 @@ func TestCreateAndList(t *testing.T) {
 		t.Errorf("worktree dir missing: %v", err)
 	}
 
-	lst, err := m.List(env(repoDir, dataDir, "sess-1"), false)
+	lst, err := m.List(env(repoDir, dataDir, "sess-1"), ListFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestCreateReuseWhenAvailable(t *testing.T) {
 		t.Errorf("reuse should claim for caller: %+v", res)
 	}
 	// Now sess-2 holds it; from sess-2 it lists as claimed-by-self.
-	lst, _ := m2.List(env(repoDir, dataDir, "sess-2"), false)
+	lst, _ := m2.List(env(repoDir, dataDir, "sess-2"), ListFilter{})
 	if got := lst.Worktrees[0]; got.Status != "claimed" || got.ClaimedBy == nil || *got.ClaimedBy != "self" {
 		t.Errorf("after reuse: %+v", got)
 	}
@@ -162,14 +162,14 @@ func TestListStatusStaleAndDirtyAndCWD(t *testing.T) {
 	}
 
 	// From another session with the owner's pid alive => claimed by sess-1, fresh.
-	live, _ := fixedManager(true).List(env(repoDir, dataDir, "sess-2"), false)
+	live, _ := fixedManager(true).List(env(repoDir, dataDir, "sess-2"), ListFilter{})
 	it := live.Worktrees[0]
 	if it.Status != "claimed" || it.ClaimedBy == nil || *it.ClaimedBy != "sess-1" || it.StaleReason != "" {
 		t.Errorf("live other-claim: %+v stale_reason=%q", it, it.StaleReason)
 	}
 
 	// Same but the owner's pid is gone => available + stale, claimed_by null.
-	stale, _ := fixedManager(false).List(env(repoDir, dataDir, "sess-2"), false)
+	stale, _ := fixedManager(false).List(env(repoDir, dataDir, "sess-2"), ListFilter{})
 	st := stale.Worktrees[0]
 	if st.Status != "available" || st.ClaimedBy != nil || st.StaleReason == "" {
 		t.Errorf("stale claim: %+v", st)
@@ -179,7 +179,7 @@ func TestListStatusStaleAndDirtyAndCWD(t *testing.T) {
 	if live.CWDWorktree != nil {
 		t.Errorf("cwd_worktree should be null at repo root, got %v", *live.CWDWorktree)
 	}
-	inside, _ := fixedManager(true).List(env(res.Path, dataDir, "sess-1"), false)
+	inside, _ := fixedManager(true).List(env(res.Path, dataDir, "sess-1"), ListFilter{})
 	if inside.CWDWorktree == nil || *inside.CWDWorktree != "w" {
 		t.Errorf("cwd_worktree from inside worktree: %+v", inside.CWDWorktree)
 	}
@@ -188,7 +188,7 @@ func TestListStatusStaleAndDirtyAndCWD(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(res.Path, "scratch.txt"), []byte("wip"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	d, _ := fixedManager(true).List(env(repoDir, dataDir, "sess-1"), false)
+	d, _ := fixedManager(true).List(env(repoDir, dataDir, "sess-1"), ListFilter{})
 	if !d.Worktrees[0].Dirty {
 		t.Error("expected dirty=true after writing an untracked file")
 	}
@@ -228,7 +228,7 @@ func TestRemoveRefusesDirtyAndUnmergedThenForce(t *testing.T) {
 	if _, err := os.Stat(res.Path); !os.IsNotExist(err) {
 		t.Errorf("worktree dir should be gone: %v", err)
 	}
-	lst, _ := m.List(env(repoDir, dataDir, "sess-1"), false)
+	lst, _ := m.List(env(repoDir, dataDir, "sess-1"), ListFilter{})
 	if len(lst.Worktrees) != 0 {
 		t.Errorf("registry entry should be dropped, got %+v", lst.Worktrees)
 	}
@@ -265,7 +265,7 @@ func TestReconcileDroppedAndUnmanaged(t *testing.T) {
 
 	// Remove the worktree out-of-band (raw git) => list reconciles it away.
 	runT(t, repoDir, "worktree", "remove", "--force", res.Path)
-	lst, _ := m.List(env(repoDir, dataDir, "sess-1"), false)
+	lst, _ := m.List(env(repoDir, dataDir, "sess-1"), ListFilter{})
 	for _, it := range lst.Worktrees {
 		if it.Name == "managed" {
 			t.Errorf("dropped worktree should disappear from list, got %+v", it)
@@ -275,7 +275,7 @@ func TestReconcileDroppedAndUnmanaged(t *testing.T) {
 	// Add a worktree under our dir out-of-band => shows up as unmanaged.
 	ext := filepath.Join(dataDir, lst.RepoKey, "worktrees", "rogue")
 	runT(t, repoDir, "worktree", "add", "--quiet", ext, "-b", "rogue-branch")
-	lst2, _ := m.List(env(repoDir, dataDir, "sess-1"), false)
+	lst2, _ := m.List(env(repoDir, dataDir, "sess-1"), ListFilter{})
 	var found *ListItem
 	for _, it := range lst2.Worktrees {
 		if it.Name == "rogue" {
@@ -333,7 +333,7 @@ func TestCreateBadBase(t *testing.T) {
 
 func TestNotAGitRepo(t *testing.T) {
 	dir := t.TempDir() // not a git repo
-	_, err := fixedManager(true).List(env(dir, t.TempDir(), "sess-1"), false)
+	_, err := fixedManager(true).List(env(dir, t.TempDir(), "sess-1"), ListFilter{})
 	if err == nil || !strings.Contains(err.Error(), "not a git repository") {
 		t.Errorf("expected not-a-git-repo error, got %v", err)
 	}

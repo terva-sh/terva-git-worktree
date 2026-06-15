@@ -9,4 +9,4 @@ go 1.22
 //	go mod edit -replace terva.sh/terva=../terva
 //
 // and drop it before releasing (`just release-overlay vX.Y.Z` does both).
-require terva.sh/terva v0.105.2
+require terva.sh/terva v0.106.1

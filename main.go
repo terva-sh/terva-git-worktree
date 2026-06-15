@@ -39,7 +39,14 @@ func main() {
 	// and remove are side-effecting and (correctly) ask in workspace mode.
 	e.Tool("worktree_list", descList, schemaList(), a.handleList, ext.ReadOnly())
 	e.Tool("worktree_create", descCreate, schemaCreate(), a.handleCreate)
+	e.Tool("worktree_claim", descClaim, schemaName("name of an existing worktree to claim"), a.handleClaim)
+	e.Tool("worktree_release", descRelease, schemaName("name of the worktree to release"), a.handleRelease)
 	e.Tool("worktree_remove", descRemove, schemaRemove(), a.handleRemove)
+
+	// Human-facing UI: /worktree opens an interactive panel of the repo's
+	// worktrees (the model never sees it). Panel keys drive selection/refresh.
+	e.Command("worktree", "worktree panel (`/worktree collect` for the merge-back view)", a.handleCommand)
+	e.OnPanelKey(panelID, a.handleKey, a.handleClose)
 
 	// Subscribe to session_start so the host delivers it and the SDK keeps
 	// Host().SessionID current — that's the claim-owner identity our tools read
@@ -54,17 +61,20 @@ func main() {
 }
 
 const contextPolicy = "You can manage git worktrees for the current repository " +
-	"with three tools. Call worktree_list FIRST when you might need an isolated " +
+	"with five tools. Call worktree_list FIRST when you might need an isolated " +
 	"checkout: it reports every worktree as `available` or `claimed`, the commit " +
 	"it was branched from (base_commit/base_ref) and its current HEAD, whether " +
 	"it's dirty, and which one you're currently in — so you can reuse a suitable " +
-	"available worktree instead of proliferating new ones. worktree_create makes " +
-	"(or, if the name already exists and is available, reuses) a worktree and " +
-	"claims it for this session; pass `base` to branch from a specific ref. " +
-	"worktree_remove deletes one — it refuses when the worktree has uncommitted " +
-	"or unmerged/unpushed work unless you pass force:true, and leaves the branch " +
-	"unless you pass delete_branch:true. Worktrees live under the extension's own " +
-	"data dir, never inside the repo."
+	"available worktree instead of proliferating new ones (pass `match` to filter, " +
+	"e.g. available worktrees branched from main). worktree_create makes (or, if " +
+	"the name already exists and is available, reuses) a worktree and claims it " +
+	"for this session; pass `base` to branch from a specific ref. worktree_claim " +
+	"takes an existing available worktree for this session and worktree_release " +
+	"frees your claim — together they hand an idle worktree between agents without " +
+	"creating or deleting one. worktree_remove deletes one — it refuses when the " +
+	"worktree has uncommitted or unmerged/unpushed work unless you pass force:true, " +
+	"and leaves the branch unless you pass delete_branch:true. Worktrees live under " +
+	"the extension's own data dir, never inside the repo."
 
 // Tool descriptions stay terse (full policy is in contextPolicy) but keep the
 // essentials so the tools are usable when context injection is disabled.
@@ -73,7 +83,9 @@ const descList = "List git worktrees for the current repo. Read-only. Returns " 
 	"JSON: each worktree's name, path, branch, base_commit/base_ref, head_commit, " +
 	"status (available|claimed), claimed_by (self|<session>|null), stale_reason, " +
 	"dirty, and unmanaged; plus repo_key and cwd_worktree (the one you're in, or " +
-	"null). Call this before worktree_create to reuse an existing worktree."
+	"null). Optional `match` filters the results by {status, base_ref, mine} " +
+	"(e.g. available worktrees branched from main). Call this before " +
+	"worktree_create to reuse an existing worktree."
 
 const descCreate = "Create (or reuse) a git worktree and claim it for this " +
 	"session. Provide `name` (slugged; becomes branch wt/<name>). Optional " +
@@ -81,6 +93,16 @@ const descCreate = "Create (or reuse) a git worktree and claim it for this " +
 	"`reuse_if_available` (default true: if <name> exists and is available, claim " +
 	"and return it instead of erroring). Returns the worktree JSON incl. " +
 	"`reused`. Errors if <name> is claimed by another live session."
+
+const descClaim = "Claim an existing available worktree for this session by " +
+	"`name`, without creating one — use it to take over an idle worktree another " +
+	"agent left (see worktree_list). Idempotent if you already hold it; errors if " +
+	"it is claimed by another live session. Returns the worktree JSON."
+
+const descRelease = "Release this session's claim on a worktree by `name` so " +
+	"another agent can take it, without removing the worktree. Clears a stale " +
+	"claim too; errors only if the worktree is held by another live session. " +
+	"Returns JSON { name, released, status }."
 
 const descRemove = "Remove a managed git worktree by `name`. Refuses if it has " +
 	"uncommitted changes or unmerged/unpushed commits unless `force` is true. " +
@@ -104,8 +126,28 @@ func schemaList() json.RawMessage {
 	b, _ := json.Marshal(map[string]any{
 		"type": "object",
 		"properties": map[string]any{
-			"include_stale": map[string]any{"type": "boolean", "description": "reserved; stale claims are always reported as available"},
+			"match": map[string]any{
+				"type":        "object",
+				"description": "optional filter for the returned worktrees (does not affect cwd_worktree)",
+				"properties": map[string]any{
+					"status":   map[string]any{"type": "string", "enum": []string{"available", "claimed"}, "description": "only worktrees with this status"},
+					"base_ref": map[string]any{"type": "string", "description": "only worktrees branched from this ref"},
+					"mine":     map[string]any{"type": "boolean", "description": "only worktrees claimed by this session"},
+				},
+			},
 		},
+	})
+	return b
+}
+
+// schemaName builds the {name} schema shared by the single-argument tools.
+func schemaName(desc string) json.RawMessage {
+	b, _ := json.Marshal(map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"name": map[string]any{"type": "string", "description": desc},
+		},
+		"required": []string{"name"},
 	})
 	return b
 }

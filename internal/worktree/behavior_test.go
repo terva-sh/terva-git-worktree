@@ -39,7 +39,7 @@ func TestNewManagerEndToEnd(t *testing.T) {
 	if res.Status != "claimed" || res.ClaimedBy != "self" {
 		t.Errorf("create: %+v", res)
 	}
-	lst, err := m.List(env(repoDir, dataDir, "real-sess"), false)
+	lst, err := m.List(env(repoDir, dataDir, "real-sess"), ListFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +176,7 @@ func TestRemoveRecoversWhenDirDeletedOutOfBand(t *testing.T) {
 	if err != nil || !rm.Removed {
 		t.Fatalf("vanished worktree should clean up: rm=%+v err=%v", rm, err)
 	}
-	lst, _ := m.List(env(repoDir, dataDir, "s1"), false)
+	lst, _ := m.List(env(repoDir, dataDir, "s1"), ListFilter{})
 	if len(lst.Worktrees) != 0 {
 		t.Errorf("registry entry should be dropped after recovery: %+v", lst.Worktrees)
 	}
@@ -190,7 +190,7 @@ func TestListMultipleWorktreesSorted(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	lst, err := m.List(env(repoDir, dataDir, "s1"), false)
+	lst, err := m.List(env(repoDir, dataDir, "s1"), ListFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +209,7 @@ func TestListMultipleWorktreesSorted(t *testing.T) {
 
 func TestListEmpty(t *testing.T) {
 	repoDir, dataDir := newRepo(t)
-	lst, err := fixedManager(true).List(env(repoDir, dataDir, "s1"), false)
+	lst, err := fixedManager(true).List(env(repoDir, dataDir, "s1"), ListFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +274,7 @@ func TestCorruptRegistrySurfacesError(t *testing.T) {
 	if err := os.WriteFile(r.registryPath(), []byte("{ not json"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.List(env(repoDir, dataDir, "s1"), false); err == nil || !strings.Contains(err.Error(), "parse registry") {
+	if _, err := m.List(env(repoDir, dataDir, "s1"), ListFilter{}); err == nil || !strings.Contains(err.Error(), "parse registry") {
 		t.Errorf("corrupt registry should surface a parse error, got %v", err)
 	}
 }

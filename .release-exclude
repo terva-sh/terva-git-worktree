@@ -4,5 +4,6 @@
 # Maintainer-only release plumbing (the public justfile imports it via `import?`).
 release.just
 
-# Internal design/planning brief — kept off the public mirror.
+# Internal design/planning briefs — kept off the public mirror.
 terva-git-worktree-design.md
+docs/terva-core-requirements.md

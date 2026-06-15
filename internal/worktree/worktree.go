@@ -258,6 +258,149 @@ func (m *Manager) createResult(r *repo, name string, e *Entry, reused bool) *Cre
 	}
 }
 
+// ClaimArgs are the inputs to Claim.
+type ClaimArgs struct {
+	Name string
+}
+
+// ClaimResult is the JSON shape Claim returns.
+type ClaimResult struct {
+	Name           string `json:"name"`
+	Path           string `json:"path"`
+	Branch         string `json:"branch"`
+	BaseCommit     string `json:"base_commit"`
+	BaseRef        string `json:"base_ref"`
+	HeadCommit     string `json:"head_commit"`
+	Status         string `json:"status"`     // "claimed"
+	ClaimedBy      string `json:"claimed_by"` // "self"
+	ReclaimedStale bool   `json:"reclaimed_stale,omitempty"`
+}
+
+// Claim takes an existing managed worktree for the current session without
+// creating or deleting one — the clean hand-off primitive for reusing an idle
+// (available) worktree. Idempotent when this session already holds it; refuses a
+// worktree held by another live session. Reclaiming a stale claim is allowed and
+// reported via reclaimed_stale.
+func (m *Manager) Claim(env Env, args ClaimArgs) (*ClaimResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	name := slugify(args.Name)
+	if name == "" {
+		return nil, fmt.Errorf("name is required")
+	}
+	r, err := resolveRepo(env)
+	if err != nil {
+		return nil, err
+	}
+	lk, err := acquireLock(r.lockPath())
+	if err != nil {
+		return nil, fmt.Errorf("lock repo: %w", err)
+	}
+	defer lk.release()
+
+	reg, err := loadRegistry(r.fs, r.registryName())
+	if err != nil {
+		return nil, err
+	}
+	gwts, err := listWorktrees(r.cwd)
+	if err != nil {
+		return nil, err
+	}
+	reconcile(r, reg, gwts)
+
+	entry, ok := reg.Worktrees[name]
+	if !ok {
+		return nil, fmt.Errorf("no managed worktree %q; use worktree_create to make one", name)
+	}
+	st := m.deriveStatus(entry.Claim, env.SessionID)
+	switch {
+	case st.ClaimedBy == "self":
+		// Already ours — idempotent, no write needed.
+	case st.State == "available":
+		entry.Claim = m.newClaim(env.SessionID)
+		if err := saveRegistry(r.registryPath(), reg); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("worktree %q is claimed by %s; cannot claim", name, st.ClaimedBy)
+	}
+	path := r.worktreePath(name)
+	return &ClaimResult{
+		Name:           name,
+		Path:           path,
+		Branch:         entry.Branch,
+		BaseCommit:     entry.BaseCommit,
+		BaseRef:        entry.BaseRef,
+		HeadCommit:     headCommit(path),
+		Status:         "claimed",
+		ClaimedBy:      "self",
+		ReclaimedStale: st.Stale,
+	}, nil
+}
+
+// ReleaseArgs are the inputs to Release.
+type ReleaseArgs struct {
+	Name string
+}
+
+// ReleaseResult is the JSON shape Release returns.
+type ReleaseResult struct {
+	Name     string `json:"name"`
+	Released bool   `json:"released"` // true if a claim was cleared
+	Status   string `json:"status"`   // "available" afterward
+}
+
+// Release frees this session's claim on a managed worktree so another agent can
+// take it, without removing the worktree. Clearing a stale claim (no live owner)
+// is allowed as cleanup; releasing a worktree held by another live session is
+// refused.
+func (m *Manager) Release(env Env, args ReleaseArgs) (*ReleaseResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	name := slugify(args.Name)
+	if name == "" {
+		return nil, fmt.Errorf("name is required")
+	}
+	r, err := resolveRepo(env)
+	if err != nil {
+		return nil, err
+	}
+	lk, err := acquireLock(r.lockPath())
+	if err != nil {
+		return nil, fmt.Errorf("lock repo: %w", err)
+	}
+	defer lk.release()
+
+	reg, err := loadRegistry(r.fs, r.registryName())
+	if err != nil {
+		return nil, err
+	}
+	gwts, err := listWorktrees(r.cwd)
+	if err != nil {
+		return nil, err
+	}
+	reconcile(r, reg, gwts)
+
+	entry, ok := reg.Worktrees[name]
+	if !ok {
+		return nil, fmt.Errorf("no managed worktree %q", name)
+	}
+	st := m.deriveStatus(entry.Claim, env.SessionID)
+	if st.State == "claimed" && st.ClaimedBy != "self" {
+		return nil, fmt.Errorf("worktree %q is claimed by %s; only its owner can release it", name, st.ClaimedBy)
+	}
+	released := entry.Claim != nil
+	if released {
+		entry.Claim = nil
+		if err := saveRegistry(r.registryPath(), reg); err != nil {
+			return nil, err
+		}
+	}
+	return &ReleaseResult{Name: name, Released: released, Status: "available"}, nil
+}
+
 // ListResult is the JSON shape List returns.
 type ListResult struct {
 	RepoKey     string      `json:"repo_key"`
@@ -280,10 +423,34 @@ type ListItem struct {
 	Unmanaged   bool    `json:"unmanaged,omitempty"`
 }
 
+// ListFilter narrows what List returns. The zero value matches everything.
+type ListFilter struct {
+	Status  string // "" any | "available" | "claimed"
+	BaseRef string // "" any | only worktrees whose base_ref equals this
+	Mine    bool   // only worktrees claimed by the current session
+}
+
+func (f ListFilter) empty() bool { return f.Status == "" && f.BaseRef == "" && !f.Mine }
+
+func (f ListFilter) matches(it *ListItem) bool {
+	if f.Status != "" && it.Status != f.Status {
+		return false
+	}
+	if f.BaseRef != "" && it.BaseRef != f.BaseRef {
+		return false
+	}
+	if f.Mine && (it.ClaimedBy == nil || *it.ClaimedBy != "self") {
+		return false
+	}
+	return true
+}
+
 // List joins git's worktree list with the registry, derives status, and reports
 // drift (base vs current HEAD), dirtiness, and which worktree cwd is in. It is
-// read-only except for reconciling away worktrees git has dropped.
-func (m *Manager) List(env Env, includeStale bool) (*ListResult, error) {
+// read-only except for reconciling away worktrees git has dropped. An optional
+// filter narrows the returned worktrees (e.g. available ones branched from main)
+// without affecting cwd_worktree.
+func (m *Manager) List(env Env, filter ListFilter) (*ListResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -357,6 +524,8 @@ func (m *Manager) List(env Env, includeStale bool) (*ListResult, error) {
 		})
 	}
 
+	// cwd_worktree reflects where the agent actually is, independent of the
+	// filter — compute it from the full set before narrowing.
 	var cwdName *string
 	if top := topLevel(env.CWD); top != "" {
 		for _, it := range items {
@@ -366,6 +535,16 @@ func (m *Manager) List(env Env, includeStale bool) (*ListResult, error) {
 				break
 			}
 		}
+	}
+
+	if !filter.empty() {
+		kept := make([]*ListItem, 0, len(items))
+		for _, it := range items {
+			if filter.matches(it) {
+				kept = append(kept, it)
+			}
+		}
+		items = kept
 	}
 
 	return &ListResult{RepoKey: r.key, CWDWorktree: cwdName, Worktrees: items}, nil
@@ -464,6 +643,81 @@ func (m *Manager) Remove(env Env, args RemoveArgs) (*RemoveResult, error) {
 		return nil, err
 	}
 	return &RemoveResult{Name: name, Removed: true, BranchDeleted: branchDeleted}, nil
+}
+
+// collectMaxCommits bounds the per-worktree commit list in a collect view.
+const collectMaxCommits = 10
+
+// CollectResult summarizes the work pending across all managed worktrees so the
+// user can decide what to merge back. The extension never merges automatically.
+type CollectResult struct {
+	RepoKey   string         `json:"repo_key"`
+	Worktrees []*CollectItem `json:"worktrees"`
+}
+
+// CollectItem is one worktree's pending work relative to its base.
+type CollectItem struct {
+	Name       string   `json:"name"`
+	Branch     string   `json:"branch"`
+	BaseRef    string   `json:"base_ref"`
+	BaseCommit string   `json:"base_commit"`
+	HeadCommit string   `json:"head_commit"`
+	Ahead      int      `json:"ahead"`             // commits beyond base
+	Commits    []string `json:"commits,omitempty"` // oneline subjects (capped)
+	Dirty      bool     `json:"dirty"`
+	Unpushed   bool     `json:"unpushed"` // has commits not on an upstream (best-effort)
+}
+
+// Collect reports, per managed worktree, how far its branch is ahead of its base
+// (with the commit subjects), whether it is dirty, and whether it has unpushed
+// work — the read-only merge-back overview. It never merges; the user reviews and
+// merges manually.
+func (m *Manager) Collect(env Env) (*CollectResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	r, err := resolveRepo(env)
+	if err != nil {
+		return nil, err
+	}
+	lk, err := acquireLock(r.lockPath())
+	if err != nil {
+		return nil, fmt.Errorf("lock repo: %w", err)
+	}
+	defer lk.release()
+
+	reg, err := loadRegistry(r.fs, r.registryName())
+	if err != nil {
+		return nil, err
+	}
+	gwts, err := listWorktrees(r.cwd)
+	if err != nil {
+		return nil, err
+	}
+	if reconcile(r, reg, gwts) {
+		_ = saveRegistry(r.registryPath(), reg)
+	}
+
+	items := make([]*CollectItem, 0, len(reg.Worktrees))
+	for _, name := range sortedNames(reg.Worktrees) {
+		e := reg.Worktrees[name]
+		path := r.worktreePath(name)
+		ahead, commits := aheadCommits(path, e.BaseCommit, collectMaxCommits)
+		dirty, _ := worktreeDirty(path)
+		unpushed, _ := hasUnmergedWork(path, e.BaseCommit)
+		items = append(items, &CollectItem{
+			Name:       name,
+			Branch:     e.Branch,
+			BaseRef:    e.BaseRef,
+			BaseCommit: e.BaseCommit,
+			HeadCommit: headCommit(path),
+			Ahead:      ahead,
+			Commits:    commits,
+			Dirty:      dirty,
+			Unpushed:   unpushed,
+		})
+	}
+	return &CollectResult{RepoKey: r.key, Worktrees: items}, nil
 }
 
 func claimedByPtr(s string) *string {

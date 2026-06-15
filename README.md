@@ -14,8 +14,10 @@ later phases (see `terva-git-worktree-design.md`).
 
 | Tool | Effect | Summary |
 |------|--------|---------|
-| `worktree_list` | read-only | Lists worktrees with status (`available`/`claimed`), `base_commit`/`base_ref`, `head_commit`, `dirty`, `claimed_by`, `stale_reason`, plus `repo_key` and `cwd_worktree` (the one you're in, or null). The agent's pre-decision call; declared `ReadOnly()` so it runs promptless. |
+| `worktree_list` | read-only | Lists worktrees with status (`available`/`claimed`), `base_commit`/`base_ref`, `head_commit`, `dirty`, `claimed_by`, `stale_reason`, plus `repo_key` and `cwd_worktree` (the one you're in, or null). Optional `match` filter (`status` / `base_ref` / `mine`). The agent's pre-decision call; declared `ReadOnly()` so it runs promptless. |
 | `worktree_create` | side-effecting | Creates (or, when the name already exists and is available, **reuses**) a worktree and **claims** it for this session. Optional `base` ref/SHA (default current HEAD); `reuse_if_available` (default true). Branch is `wt/<name>`. |
+| `worktree_claim` | side-effecting | **Claims** an existing available worktree for this session without creating one — take over an idle worktree another agent left. Idempotent if already yours; refused if held by another live session. |
+| `worktree_release` | side-effecting | **Releases** your claim so another agent can take the worktree, without removing it. Clears a stale claim too; refused only if held by another live session. |
 | `worktree_remove` | side-effecting | Removes a managed worktree. **Refuses** on uncommitted or unmerged/unpushed work unless `force: true`. Leaves the branch unless `delete_branch: true`. |
 
 All tools return JSON as their text result so the agent can parse and reason over
@@ -36,8 +38,11 @@ extension's `registry.json` augments each worktree with **base commit**, **claim
 
 `worktree_create` claims for the current session; asking for an existing
 *available* name claims and returns it (`reused: true`) instead of erroring. A
-name claimed by another *live* session is refused. Claims are released by
-`worktree_remove` or go stale when the owning session/pid is gone.
+name claimed by another *live* session is refused. To hand an *idle* worktree
+between agents without creating or deleting one, use `worktree_claim` /
+`worktree_release`: release frees your claim, and another session can then claim
+the now-available worktree. Claims also go stale when the owning session/pid is
+gone (reclaimable, reported via `stale_reason` / `reclaimed_stale`).
 
 ## Storage & repo keying
 
@@ -69,17 +74,41 @@ their contents).
 in read-only/workspace approval modes — the agent's pre-decision call is cheap
 and promptless.
 
-`worktree_create` and `worktree_remove` are side-effecting, so they **ask** in
-`workspace` mode (the interactive default) — which is the intended gate for the
-one irreversible op, removing a checkout. For enforcement across all modes
-(headless/yolo), add a permission rule pinning `worktree_remove` to `ask`/`deny`.
+`worktree_create`, `worktree_claim`, `worktree_release`, and `worktree_remove`
+are side-effecting, so they **ask** in `workspace` mode (the interactive
+default) — which is the intended gate for the one irreversible op, removing a
+checkout. For enforcement across all modes (headless/yolo), add a permission rule
+pinning `worktree_remove` to `ask`/`deny`.
+
+## The `/worktree` panel
+
+`/worktree` opens an interactive panel (human-facing; the model never sees it)
+listing the repo's worktrees with status, base ref/commit, HEAD drift, a dirty
+marker, and a `(here)` tag for the one you're in. It updates live as the agent
+creates/claims/removes worktrees, and a compact `worktrees N · M yours` segment
+shows in the status bar. Pressing `↵` on a selected worktree switches the host
+into it (`/cd <path>`). Keys: `↑`/`↓` select · `↵` cd · `c` collect · `r`
+refresh · `esc` close.
+
+`/worktree collect` (or `c` in the panel) switches to the **merge-back overview**:
+per worktree, how far its branch is ahead of its base, the commit subjects, and
+dirty/unpushed flags — so you can see what's pending across all worktrees. It is
+read-only and **never auto-merges**; you review and `git merge` yourself.
 
 ## Requirements
 
-terva **v0.105.2+** — extension protocol v2 plus the SDK pieces this extension
-relies on: the `ReadOnly()` tool option, `Host().DataFS()`, and `Host().CWD`
-following `/cd` (it rides `session_start`). Go **1.22+**, and a `git` binary on
-PATH (the extension shells out with explicit `-C`).
+terva **v0.106.1+** — extension protocol v2 plus the SDK pieces this extension
+relies on: the `ReadOnly()` tool option, `Host().DataFS()`, `Host().CWD`
+following `/cd` (it rides `session_start`), and `ext.SubmitSlash` (panel-Enter →
+`/cd`). Go **1.22+**, and a `git` binary on PATH (the extension shells out with
+explicit `-C`).
+
+> **Swarm worktree isolation.** terva v0.106.1 also adds a
+> `swarm.Config.AcquireWorktree` seam that the host can wire (via
+> `manager.InvokeTool`) to this extension's `worktree_create`/`worktree_release`,
+> giving each swarm sub-agent its own worktree. That integration lives in terva
+> core and is opt-in there; this extension needs no change to participate — it
+> just exposes the tools terva calls.
 
 ## Layout
 
