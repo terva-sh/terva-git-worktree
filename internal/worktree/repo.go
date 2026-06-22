@@ -35,6 +35,11 @@ type Env struct {
 	FS        RegistryFS // extension data layer (DataDir over install dir)
 	CWD       string     // resolve the repo from here (never the extension's own cwd)
 	SessionID string     // claim owner identity; "" => no active session
+	// RepoRoot is an optional explicit target repo (the tool's repo_root arg),
+	// resolved instead of CWD. Absolute, or relative to CWD. It is an escape
+	// hatch for operating on a repo the cwd is not inside; CWD stays the
+	// authority for "which worktree am I in" (cwd_worktree). "" => use CWD.
+	RepoRoot string
 }
 
 // repo identifies the canonical git repository shared across the main checkout
@@ -46,9 +51,10 @@ type repo struct {
 	key string // stable per-repo storage key (<DataDir>/<key>/...)
 }
 
-// resolveRepo derives the canonical repo identity from env.CWD. It keys on the
-// git *common* dir (shared by the main checkout and every linked worktree)
-// rather than cwd or the host ProjectID (both cwd-keyed, which would scatter a
+// resolveRepo derives the canonical repo identity from env.CWD — or from
+// env.RepoRoot when the caller supplies that override. It keys on the git
+// *common* dir (shared by the main checkout and every linked worktree) rather
+// than cwd or the host ProjectID (both cwd-keyed, which would scatter a
 // worktree's view from the main checkout's) — exactly what list/reuse needs.
 func resolveRepo(env Env) (*repo, error) {
 	if env.CWD == "" {
@@ -57,15 +63,110 @@ func resolveRepo(env Env) (*repo, error) {
 	if env.FS == nil {
 		return nil, fmt.Errorf("no data directory reported by host")
 	}
-	common, err := runGit(env.CWD, "rev-parse", "--git-common-dir")
+	// dir is both where we probe for the repo and the -C directory for every
+	// repo-level git call (repo.cwd). It defaults to the host cwd — left
+	// untouched so behavior is byte-for-byte identical without an override — and
+	// becomes the resolved RepoRoot when one is given.
+	dir := env.CWD
+	if env.RepoRoot != "" {
+		dir = env.RepoRoot
+		if !filepath.IsAbs(dir) {
+			dir = filepath.Join(env.CWD, dir)
+		}
+		dir = canonPath(dir)
+	}
+	common, err := runGit(dir, "rev-parse", "--git-common-dir")
 	if err != nil {
-		return nil, fmt.Errorf("not a git repository (cwd %s): %w", env.CWD, err)
+		if env.RepoRoot != "" {
+			return nil, fmt.Errorf("not a git repository (repo_root %s): %w", env.RepoRoot, err)
+		}
+		return nil, noRepoError(env.CWD, err)
 	}
 	if !filepath.IsAbs(common) {
-		common = filepath.Join(env.CWD, common)
+		common = filepath.Join(dir, common)
 	}
 	common = canonPath(common)
-	return &repo{fs: env.FS, cwd: env.CWD, key: repoKey(common)}, nil
+	return &repo{fs: env.FS, cwd: dir, key: repoKey(common)}, nil
+}
+
+const (
+	// maxRepoProbe bounds how many .git-bearing children we confirm with a git
+	// invocation, so a directory full of .git-looking entries can't fan out into
+	// many git calls. The pre-filter (a .git entry must exist) keeps this small.
+	maxRepoProbe = 8
+	// maxRepoHints bounds how many discovered repos we name in an error, so a
+	// scratch dir holding many checkouts doesn't dump an unbounded list.
+	maxRepoHints = 3
+)
+
+// nearbyRepos does a shallow, bounded scan of cwd's immediate children for git
+// checkouts, returning their cwd-relative paths (e.g. "./terva") — the input to
+// a "you're one directory away" hint. Best-effort: an unreadable cwd or a child
+// that doesn't confirm yields no entry, never a failure. It never recurses and
+// never follows symlinks. Bare repos (no .git entry) are naturally excluded —
+// they're a poor /cd target anyway.
+func nearbyRepos(cwd string) []string {
+	entries, err := os.ReadDir(cwd) // sorted by name => deterministic output
+	if err != nil {
+		return nil
+	}
+	var found []string
+	probed := 0
+	for _, e := range entries {
+		// Immediate child directories only; skip files and symlinks (a symlink
+		// reports !IsDir here), so a symlink loop or a symlink to a huge tree
+		// cannot blow up the scan.
+		if !e.IsDir() {
+			continue
+		}
+		child := filepath.Join(cwd, e.Name())
+		// A .git entry — a dir for a normal checkout, a file for a linked
+		// worktree — is the cheap pre-filter before we spend a git invocation.
+		// Lstat so a symlinked .git doesn't get followed.
+		if _, err := os.Lstat(filepath.Join(child, ".git")); err != nil {
+			continue
+		}
+		if probed >= maxRepoProbe {
+			break
+		}
+		probed++
+		// Confirm it's a real checkout with the exact probe resolveRepo trusts,
+		// not a stray .git that isn't a repo.
+		if _, err := runGit(child, "rev-parse", "--git-common-dir"); err != nil {
+			continue
+		}
+		found = append(found, "./"+e.Name())
+	}
+	return found
+}
+
+// noRepoError builds the error resolveRepo returns when cwd is not a git repo.
+// When the shallow scan finds checkouts one directory down it folds concrete
+// next steps into the message (the discoverability win); with nothing nearby it
+// returns today's bare error unchanged (cause wrapped), so the no-repo-nearby
+// case doesn't regress into noisier output.
+func noRepoError(cwd string, cause error) error {
+	near := nearbyRepos(cwd)
+	if len(near) == 0 {
+		return fmt.Errorf("not a git repository (cwd %s): %w", cwd, cause)
+	}
+	if len(near) == 1 {
+		r := near[0]
+		return fmt.Errorf("not a git repository (cwd %s); found a git repo at %s — cd there (/cd %s) or pass repo_root:%q to operate on it from here",
+			cwd, r, r, r)
+	}
+	shown := near
+	extra := 0
+	if len(shown) > maxRepoHints {
+		extra = len(shown) - maxRepoHints
+		shown = shown[:maxRepoHints]
+	}
+	list := strings.Join(shown, ", ")
+	if extra > 0 {
+		list = fmt.Sprintf("%s (and %d more)", list, extra)
+	}
+	return fmt.Errorf("not a git repository (cwd %s); found git repos nearby: %s — cd into one (e.g. /cd %s) or pass repo_root (e.g. repo_root:%q)",
+		cwd, list, near[0], near[0])
 }
 
 // dataPath resolves <DataDir>/<key>/<rel> to a real writable filesystem path.

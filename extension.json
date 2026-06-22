@@ -1,6 +1,6 @@
 {
-  "name": "terva-git-worktree",
-  "version": "0.1.0",
+  "name": "git-worktree",
+  "version": "0.3.0",
   "exec": "./run.sh",
   "language": "go",
   "description": "Agent-driven git worktree management: create, list, and remove worktrees with an available/claimed reuse model.",

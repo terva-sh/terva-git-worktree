@@ -18,7 +18,7 @@ import (
 )
 
 func main() {
-	e := ext.New("terva-git-worktree", "0.1.0")
+	e := ext.New("terva-git-worktree", "0.3.0")
 
 	// Require protocol 2: we depend on session identity (claim owner) and
 	// per-extension data dir / cwd from the handshake. An older host refuses to
@@ -74,7 +74,9 @@ const contextPolicy = "You can manage git worktrees for the current repository "
 	"creating or deleting one. worktree_remove deletes one — it refuses when the " +
 	"worktree has uncommitted or unmerged/unpushed work unless you pass force:true, " +
 	"and leaves the branch unless you pass delete_branch:true. Worktrees live under " +
-	"the extension's own data dir, never inside the repo."
+	"the extension's own data dir, never inside the repo. All five tools operate on " +
+	"the cwd's repo by default; pass `repo_root` (a path) to target a different repo " +
+	"without a /cd — useful when cwd isn't a git repo but a checkout sits nearby."
 
 // Tool descriptions stay terse (full policy is in contextPolicy) but keep the
 // essentials so the tools are usable when context injection is disabled.
@@ -109,6 +111,17 @@ const descRemove = "Remove a managed git worktree by `name`. Refuses if it has "
 	"Leaves the branch by default; set `delete_branch` to also delete wt/<name>. " +
 	"Returns JSON { name, removed, branch_deleted }."
 
+// repoRootDesc documents the optional repo_root escape hatch shared by every
+// tool. The tools are cwd-first; repo_root targets a different repo without a
+// /cd (e.g. when cwd isn't a git repo but a checkout sits nearby).
+const repoRootDesc = "optional path to the target git repo (absolute, or " +
+	"relative to cwd) to operate on instead of the cwd's repo; omit to use cwd. " +
+	"cwd_worktree still reflects your real cwd, not this override"
+
+func repoRootProp() map[string]any {
+	return map[string]any{"type": "string", "description": repoRootDesc}
+}
+
 func schemaCreate() json.RawMessage {
 	b, _ := json.Marshal(map[string]any{
 		"type": "object",
@@ -116,6 +129,7 @@ func schemaCreate() json.RawMessage {
 			"name":               map[string]any{"type": "string", "description": "worktree name; slugged into branch wt/<name>"},
 			"base":               map[string]any{"type": "string", "description": "ref or SHA to branch from (default: current HEAD)"},
 			"reuse_if_available": map[string]any{"type": "boolean", "description": "if <name> exists and is available, claim and return it (default true)"},
+			"repo_root":          repoRootProp(),
 		},
 		"required": []string{"name"},
 	})
@@ -135,17 +149,20 @@ func schemaList() json.RawMessage {
 					"mine":     map[string]any{"type": "boolean", "description": "only worktrees claimed by this session"},
 				},
 			},
+			"repo_root": repoRootProp(),
 		},
 	})
 	return b
 }
 
-// schemaName builds the {name} schema shared by the single-argument tools.
+// schemaName builds the {name, repo_root} schema shared by the single-argument
+// tools (claim / release).
 func schemaName(desc string) json.RawMessage {
 	b, _ := json.Marshal(map[string]any{
 		"type": "object",
 		"properties": map[string]any{
-			"name": map[string]any{"type": "string", "description": desc},
+			"name":      map[string]any{"type": "string", "description": desc},
+			"repo_root": repoRootProp(),
 		},
 		"required": []string{"name"},
 	})
@@ -159,6 +176,7 @@ func schemaRemove() json.RawMessage {
 			"name":          map[string]any{"type": "string", "description": "name of the worktree to remove"},
 			"force":         map[string]any{"type": "boolean", "description": "remove even with uncommitted or unmerged/unpushed work"},
 			"delete_branch": map[string]any{"type": "boolean", "description": "also delete the wt/<name> branch (default false)"},
+			"repo_root":     repoRootProp(),
 		},
 		"required": []string{"name"},
 	})

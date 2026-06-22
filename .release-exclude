@@ -7,3 +7,4 @@ release.just
 # Internal design/planning briefs — kept off the public mirror.
 terva-git-worktree-design.md
 docs/terva-core-requirements.md
+docs/proposals/

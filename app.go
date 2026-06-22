@@ -66,6 +66,7 @@ type createArgs struct {
 	Name             string `json:"name"`
 	Base             string `json:"base"`
 	ReuseIfAvailable *bool  `json:"reuse_if_available"`
+	RepoRoot         string `json:"repo_root"`
 }
 
 func (a *app) handleCreate(raw json.RawMessage) ext.ToolResult {
@@ -77,6 +78,7 @@ func (a *app) handleCreate(raw json.RawMessage) ext.ToolResult {
 	if err != nil {
 		return ext.TextErrorResult(err.Error())
 	}
+	env.RepoRoot = in.RepoRoot
 	reuse := true // default true per the design
 	if in.ReuseIfAvailable != nil {
 		reuse = *in.ReuseIfAvailable
@@ -97,6 +99,7 @@ type listArgs struct {
 		BaseRef string `json:"base_ref"`
 		Mine    bool   `json:"mine"`
 	} `json:"match"`
+	RepoRoot string `json:"repo_root"`
 }
 
 func (a *app) handleList(raw json.RawMessage) ext.ToolResult {
@@ -108,6 +111,7 @@ func (a *app) handleList(raw json.RawMessage) ext.ToolResult {
 	if err != nil {
 		return ext.TextErrorResult(err.Error())
 	}
+	env.RepoRoot = in.RepoRoot
 	var filter worktree.ListFilter
 	if in.Match != nil {
 		filter = worktree.ListFilter{Status: in.Match.Status, BaseRef: in.Match.BaseRef, Mine: in.Match.Mine}
@@ -120,7 +124,8 @@ func (a *app) handleList(raw json.RawMessage) ext.ToolResult {
 }
 
 type nameArgs struct {
-	Name string `json:"name"`
+	Name     string `json:"name"`
+	RepoRoot string `json:"repo_root"`
 }
 
 func (a *app) handleClaim(raw json.RawMessage) ext.ToolResult {
@@ -132,6 +137,7 @@ func (a *app) handleClaim(raw json.RawMessage) ext.ToolResult {
 	if err != nil {
 		return ext.TextErrorResult(err.Error())
 	}
+	env.RepoRoot = in.RepoRoot
 	res, err := a.mgr.Claim(env, worktree.ClaimArgs{Name: in.Name})
 	if err != nil {
 		return ext.TextErrorResult(err.Error())
@@ -149,6 +155,7 @@ func (a *app) handleRelease(raw json.RawMessage) ext.ToolResult {
 	if err != nil {
 		return ext.TextErrorResult(err.Error())
 	}
+	env.RepoRoot = in.RepoRoot
 	res, err := a.mgr.Release(env, worktree.ReleaseArgs{Name: in.Name})
 	if err != nil {
 		return ext.TextErrorResult(err.Error())
@@ -161,6 +168,7 @@ type removeArgs struct {
 	Name         string `json:"name"`
 	Force        bool   `json:"force"`
 	DeleteBranch bool   `json:"delete_branch"`
+	RepoRoot     string `json:"repo_root"`
 }
 
 func (a *app) handleRemove(raw json.RawMessage) ext.ToolResult {
@@ -172,6 +180,7 @@ func (a *app) handleRemove(raw json.RawMessage) ext.ToolResult {
 	if err != nil {
 		return ext.TextErrorResult(err.Error())
 	}
+	env.RepoRoot = in.RepoRoot
 	res, err := a.mgr.Remove(env, worktree.RemoveArgs{
 		Name: in.Name, Force: in.Force, DeleteBranch: in.DeleteBranch,
 	})
