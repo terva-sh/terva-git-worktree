@@ -236,3 +236,50 @@ func TestNotAGitRepoNoNearbyUnchanged(t *testing.T) {
 		t.Errorf("no-nearby message should carry no hint: %s", msg)
 	}
 }
+
+// --- GitAvailable: the session-context gate predicate ------------------------
+
+// cwd is itself a repo → available.
+func TestGitAvailableCwdIsRepo(t *testing.T) {
+	repoDir, _ := newRepo(t)
+	if !GitAvailable(repoDir) {
+		t.Errorf("GitAvailable(%q) = false, want true (cwd is a repo)", repoDir)
+	}
+}
+
+// cwd is inside a linked worktree (its .git is a file) → available.
+func TestGitAvailableInsideLinkedWorktree(t *testing.T) {
+	main, _ := newRepo(t)
+	scratch := t.TempDir()
+	linked := filepath.Join(scratch, "linked")
+	runT(t, main, "worktree", "add", "-q", linked)
+	if !GitAvailable(linked) {
+		t.Error("GitAvailable inside a linked worktree should be true")
+	}
+}
+
+// cwd is NOT a repo but an immediate child is (repo_root-reachable) → available.
+func TestGitAvailableNearbyChildRepo(t *testing.T) {
+	scratch := t.TempDir()
+	initChildRepo(t, scratch, "terva")
+	if !GitAvailable(scratch) {
+		t.Error("GitAvailable should be true when an immediate child is a repo")
+	}
+}
+
+// A non-repo dir whose only child is a plain dir → not available.
+func TestGitAvailableFalseForPlainDir(t *testing.T) {
+	scratch := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(scratch, "plain"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if GitAvailable(scratch) {
+		t.Error("GitAvailable should be false for a non-repo dir with no repo children")
+	}
+}
+
+func TestGitAvailableFalseForEmptyString(t *testing.T) {
+	if GitAvailable("") {
+		t.Error(`GitAvailable("") should be false`)
+	}
+}

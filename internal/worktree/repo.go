@@ -140,6 +140,22 @@ func nearbyRepos(cwd string) []string {
 	return found
 }
 
+// GitAvailable reports whether the worktree tools can do anything useful from
+// dir: either dir is inside a git repo, or a git checkout sits in an immediate
+// child (reachable via repo_root). Best-effort and cheap — one git probe plus,
+// only when that misses, the same bounded child scan nearbyRepos performs. An
+// empty dir or any error reports false. Used once per new session to decide
+// whether to keep the standing worktree policy in the model's context.
+func GitAvailable(dir string) bool {
+	if dir == "" {
+		return false
+	}
+	if _, err := runGit(dir, "rev-parse", "--git-common-dir"); err == nil {
+		return true
+	}
+	return len(nearbyRepos(dir)) > 0
+}
+
 // noRepoError builds the error resolveRepo returns when cwd is not a git repo.
 // When the shallow scan finds checkouts one directory down it folds concrete
 // next steps into the message (the discoverability win); with nothing nearby it

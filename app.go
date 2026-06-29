@@ -27,6 +27,9 @@ type app struct {
 	selected    int
 	last        *worktree.ListResult    // most recent list snapshot (for panel keys)
 	lastCollect *worktree.CollectResult // most recent collect snapshot
+
+	ctxDecided bool   // whether the static-context block has been decided yet
+	ctxSession string // session id the current static-context decision is pinned to
 }
 
 func newApp(e *ext.Extension) *app {
@@ -34,16 +37,63 @@ func newApp(e *ext.Extension) *app {
 }
 
 // onSession exists so the extension subscribes to session_start; the SDK updates
-// Host().SessionID (our claim owner) before this runs. If the panel is open we
-// refresh it (a /cd may have moved us to a different repo); otherwise we skip the
-// git work for sessions that never touch worktrees.
+// Host().SessionID (our claim owner) and Host().CWD before this runs. On a new
+// session it pins what the extension shows the model — policy and tools (see
+// pinContext). If the panel is open we also refresh it (a /cd may have moved us
+// to a different repo); otherwise we skip the git work for sessions that never
+// touch worktrees.
 func (a *app) onSession(s ext.Session) {
 	a.e.Logf("active session: %q", s.ID)
+	a.pinContext(s)
 	a.mu.Lock()
 	open := a.panelOpen
 	a.mu.Unlock()
 	if open {
 		a.refresh()
+	}
+}
+
+// pinContext decides, once per session, what this extension puts in front of the
+// model and pins it for the session's life: when git is available at or near the
+// session's cwd it keeps the standing worktree policy and tools; when it isn't,
+// it drops the policy and — on protocol 4+ — withdraws all five tools, so a
+// workspace with no usable repo gets nothing from this extension to burn tokens
+// on or misfire. It acts ONLY on a genuinely new session id, never on a
+// same-session /cd: both the context block and the tool set live in the cached
+// prompt prefix, so flipping either mid-session would evict the prompt cache.
+// Mutations go through the boundary-scoped Session handle (cache-safe by
+// construction). Context needs host protocol 3; tool withdrawal needs protocol 4
+// — older hosts keep the startup policy and all tools visible.
+func (a *app) pinContext(s ext.Session) {
+	proto := s.ProtocolVersion()
+	if proto < 3 {
+		return // no RefreshContext on this host; keep the startup contribution
+	}
+	a.mu.Lock()
+	isNew := !a.ctxDecided || s.ID != a.ctxSession
+	a.ctxDecided, a.ctxSession = true, s.ID
+	a.mu.Unlock()
+	if !isNew || s.ID == "" {
+		return // same-session /cd (pinned), or a session close / no-session
+	}
+	cwd := s.CWD
+	if cwd == "" {
+		cwd = a.e.Host().CWD
+	}
+	if worktree.GitAvailable(cwd) {
+		s.RefreshContext(contextPolicy) // host no-ops if already the active block
+		if proto >= 4 {
+			s.RestoreAllTools() // host no-ops if nothing was withdrawn
+		}
+		a.e.Logf("session %q: git at/near %q — worktree policy kept, tools visible", s.ID, cwd)
+	} else {
+		s.RefreshContext("") // drop the standing policy
+		tools := "kept (host < protocol 4)"
+		if proto >= 4 {
+			s.WithdrawAllTools() // hide all five — nothing they can do here
+			tools = "withdrawn"
+		}
+		a.e.Logf("session %q: no git at/near %q — worktree policy excluded, tools %s", s.ID, cwd, tools)
 	}
 }
 

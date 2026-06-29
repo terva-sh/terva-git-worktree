@@ -18,7 +18,7 @@ import (
 )
 
 func main() {
-	e := ext.New("terva-git-worktree", "0.3.0")
+	e := ext.New("terva-git-worktree", "0.4.0")
 
 	// Require protocol 2: we depend on session identity (claim owner) and
 	// per-extension data dir / cwd from the handshake. An older host refuses to
@@ -61,22 +61,23 @@ func main() {
 }
 
 const contextPolicy = "You can manage git worktrees for the current repository " +
-	"with five tools. Call worktree_list FIRST when you might need an isolated " +
-	"checkout: it reports every worktree as `available` or `claimed`, the commit " +
-	"it was branched from (base_commit/base_ref) and its current HEAD, whether " +
-	"it's dirty, and which one you're currently in — so you can reuse a suitable " +
-	"available worktree instead of proliferating new ones (pass `match` to filter, " +
-	"e.g. available worktrees branched from main). worktree_create makes (or, if " +
-	"the name already exists and is available, reuses) a worktree and claims it " +
-	"for this session; pass `base` to branch from a specific ref. worktree_claim " +
-	"takes an existing available worktree for this session and worktree_release " +
-	"frees your claim — together they hand an idle worktree between agents without " +
-	"creating or deleting one. worktree_remove deletes one — it refuses when the " +
-	"worktree has uncommitted or unmerged/unpushed work unless you pass force:true, " +
-	"and leaves the branch unless you pass delete_branch:true. Worktrees live under " +
-	"the extension's own data dir, never inside the repo. All five tools operate on " +
-	"the cwd's repo by default; pass `repo_root` (a path) to target a different repo " +
-	"without a /cd — useful when cwd isn't a git repo but a checkout sits nearby."
+	"with five tools. All five operate on the cwd's repo by default; pass " +
+	"`repo_root` (a path) to target a different repo without a /cd — useful when " +
+	"cwd isn't itself a git repo but a checkout sits nearby. Call worktree_list " +
+	"FIRST when you might need an isolated checkout: it reports every worktree as " +
+	"`available` or `claimed`, the commit it was branched from " +
+	"(base_commit/base_ref) and its current HEAD, whether it's dirty, and which " +
+	"one you're currently in — so you can reuse a suitable available worktree " +
+	"instead of proliferating new ones (pass `match` to filter, e.g. available " +
+	"worktrees branched from main). worktree_create makes (or, if the name already " +
+	"exists and is available, reuses) a worktree and claims it for this session; " +
+	"pass `base` to branch from a specific ref. worktree_claim takes an existing " +
+	"available worktree for this session and worktree_release frees your claim — " +
+	"together they hand an idle worktree between agents without creating or " +
+	"deleting one. worktree_remove deletes one — it refuses when the worktree has " +
+	"uncommitted or unmerged/unpushed work unless you pass force:true, and leaves " +
+	"the branch unless you pass delete_branch:true. Worktrees live under the " +
+	"extension's own data dir, never inside the repo."
 
 // Tool descriptions stay terse (full policy is in contextPolicy) but keep the
 // essentials so the tools are usable when context injection is disabled.

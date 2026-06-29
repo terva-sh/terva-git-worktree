@@ -80,6 +80,27 @@ default) — which is the intended gate for the one irreversible op, removing a
 checkout. For enforcement across all modes (headless/yolo), add a permission rule
 pinning `worktree_remove` to `ask`/`deny`.
 
+## Standing context (and quiet tools)
+
+The extension contributes a short **standing policy** to the model (how to use
+the five tools, when to prefer reuse) — folded into the cached system prompt, not
+re-sent per turn.
+
+When **neither** the session's cwd **nor** an immediate child directory is a git
+repository, there is nothing the worktree tools can usefully do, so the extension
+goes quiet: it **drops the standing policy** (protocol 3) and **withdraws all
+five tools** from the model (protocol 4), so the model is neither told to reach
+for nor even shown tools that can only refuse. A child repo keeps both — the
+tools are reachable there via `repo_root`. This decision is **pinned per
+session**: made once at session start and never changed mid-session by a `/cd`,
+because both the policy block and the tool set live in the cached prompt prefix,
+so flipping either mid-session would evict the prompt cache. A new session
+re-decides.
+
+Degradation is by host protocol: **v4+** drops policy and tools; **v3** drops the
+policy but leaves the tools visible; **below v3** the policy is always present and
+all tools visible (no regression).
+
 ## The `/worktree` panel
 
 `/worktree` opens an interactive panel (human-facing; the model never sees it)
@@ -97,11 +118,15 @@ read-only and **never auto-merges**; you review and `git merge` yourself.
 
 ## Requirements
 
-terva **v0.106.1+** — extension protocol v2 plus the SDK pieces this extension
-relies on: the `ReadOnly()` tool option, `Host().DataFS()`, `Host().CWD`
-following `/cd` (it rides `session_start`), and `ext.SubmitSlash` (panel-Enter →
-`/cd`). Go **1.22+**, and a `git` binary on PATH (the extension shells out with
-explicit `-C`).
+Built against the terva SDK **v0.110.0**, but declares **protocol v2** as its
+floor so it still loads on older hosts. It relies on: the `ReadOnly()` tool
+option, `Host().DataFS()`, `Host().CWD` following `/cd` (it rides
+`session_start`), and `ext.SubmitSlash` (panel-Enter → `/cd`). The
+quiet-in-a-non-git-workspace behavior (see **Standing context**) uses **protocol
+v3** (`RefreshContext`, to drop the standing policy) and **protocol v4**
+(`WithdrawTools`, to hide the tools), each only when the host offers it and
+degrading gracefully below. Go **1.22+**, and a `git` binary on PATH (the
+extension shells out with explicit `-C`).
 
 > **Swarm worktree isolation.** terva v0.106.1 also adds a
 > `swarm.Config.AcquireWorktree` seam that the host can wire (via
